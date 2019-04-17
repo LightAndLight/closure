@@ -2,7 +2,7 @@
 {-# language OverloadedStrings #-}
 module Closure where
 
-import Control.Applicative (Alternative, (<|>), (<**>), many, some)
+import Control.Applicative (Alternative, (<|>), (<**>), many, some, optional)
 import Data.String (IsString)
 import Data.Void (Void)
 import Text.Megaparsec (MonadParsec, Tokens, Token, sepBy, between, eof, parse, try)
@@ -17,6 +17,12 @@ data Exp
   | Nil
   | Cons Exp Exp
   | Unit
+  | Ann Exp Ty
+  deriving (Eq, Show)
+
+data Ty
+  = TyArr Ty Ty
+  | TyUnit
   deriving (Eq, Show)
 
 fromInt :: Int -> Exp
@@ -36,12 +42,29 @@ chainl1 p op = scan where
   rst = try ((\f y g x -> g (f x y)) <$> op <*> p) <*> rst <|> pure id
 {-# INLINE chainl1 #-}
 
-parseExp :: (IsString (Tokens s), MonadParsec Void s m, Token s ~ Char) => m Exp
-parseExp = token exp <* eof
+token :: (IsString (Tokens s), MonadParsec Void s m, Token s ~ Char) => m a -> m a
+token m = m <* many space1
+
+parseTy :: (IsString (Tokens s), MonadParsec Void s m, Token s ~ Char) => m Ty
+parseTy = token ty
   where
-    token m = m <* many space1
-    exp = appF <|> lam
+    ty = tyArr
+    atom = unit <|> between (token $ char '(') (char ')') (token ty)
+    unit = TyUnit <$ string "Unit"
+    tyArr =
+      (\a -> maybe a (TyArr a)) <$>
+      atom <*>
+      optional (try (many space1 *> token (string "->")) *> tyArr)
+
+parseExp :: (IsString (Tokens s), MonadParsec Void s m, Token s ~ Char) => m Exp
+parseExp = token exp
+  where
+    exp = ann <|> lam
     lam = Lam <$ token (char '\\') <*> token ctx <* token (string "->") <*> exp
+    ann =
+      (\a -> maybe a (Ann a)) <$>
+      appF <*>
+      optional (try (many space1 *> token (char ':')) *> parseTy)
     appF = chainl1 (token appT) (AppF <$ token (char '@'))
     appT = chainl1 atom (AppT <$ some space1)
     atom =
@@ -79,6 +102,9 @@ step (AppT a b) =
     Cons{} | Lam z w <- b -> pure $ Lam (a `AppT` z) w
     Cons{} | Nil <- b -> pure Nil
     Cons x y | Cons z w <- b -> pure $ Cons (a `AppT` z) (a `AppT` w)
+    Ann e t ->
+      (\e' -> Ann e' t) <$> step e <|>
+      pure e
     _ -> Nothing
 step (S a) = S <$> step a
 step (AppF a b ) =
@@ -94,11 +120,6 @@ step _ = Nothing
 
 eval :: Exp -> Exp
 eval = go where go a = maybe a go $ step a
-
-data Ty
-  = TyArr Ty Ty
-  | TyUnit
-  deriving (Eq, Show)
 
 data TypeError
   = TypeMismatch Ty Ty
@@ -165,6 +186,7 @@ infer ctx e =
           check ctx b bTy
           pure retTy
         _ -> Left $ ExpectedFunction a
+    Ann a b -> b <$ check ctx a b
     _ -> Left $ Can'tInfer e
 
 omega :: Exp
