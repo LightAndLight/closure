@@ -89,6 +89,14 @@ isCtx _ = False
 step :: Exp -> Maybe Exp
 step (AppT a b) =
   (\a' -> AppT a' b) <$> step a <|>
+  -- this is a call-by-value kind of thing
+
+  -- but we could also get a call-by-name kind of thing by only
+  -- reducing `b` when we're composing substitutions
+
+  -- a behaviour that we wouldn't carry over to compilation is the
+  -- duplication of subtitutions. when `(a, b)(x @ y) ~> (a, b)x (a, b)y`, that closure on both
+  -- sides should be the same pointer. then we can hopefully get a call-by-need thing going
   (\b' -> AppT a b') <$> step b <|>
   case a of
     Z -> pure $ AppF Z a
