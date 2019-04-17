@@ -147,7 +147,7 @@ eval st e = do
                   case insts of
                     Apply c : rest ->
                       case c of
-                        Var n -> _
+                        Var n -> lift $ writeSTRef (current st) (cl Vector.! n)
                         Addr a -> _
                     _ -> pure ()
                 NodeAppT a b ->
