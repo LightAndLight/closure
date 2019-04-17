@@ -32,9 +32,19 @@ fromInt !n =
     EQ -> Z
     GT -> S $! fromInt (n-1)
 
+toInt :: Exp -> Maybe Int
+toInt Z = Just 0
+toInt (S n) = (+1) <$> toInt n
+toInt _ = Nothing
+
 fromList :: [Exp] -> Exp
 fromList [] = Nil
 fromList (a:as) = Cons a $! fromList as
+
+toList :: Exp -> Maybe [Exp]
+toList Nil = Just []
+toList (Cons a b) = (a :) <$> toList b
+toList _ = Nothing
 
 chainl1 :: MonadParsec e s m => m a -> m (a -> a -> a) -> m a
 chainl1 p op = scan where
