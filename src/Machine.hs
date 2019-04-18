@@ -9,6 +9,7 @@ import Control.Monad.Trans (lift)
 import Data.STRef (STRef, newSTRef, readSTRef, writeSTRef, modifySTRef)
 import Data.Vector (Vector)
 import Data.Vector.Mutable (MVector)
+import Data.Word (Word32)
 
 import qualified Data.Vector as Vector
 import qualified Data.Vector.Mutable as MVector
@@ -16,8 +17,9 @@ import qualified Data.Vector.Mutable as MVector
 import Closure (Exp(..), toInt, toList)
 
 data Prim
-  = Addr Int
-  | Var Int
+  = PAddr !Int
+  | PVar !Int
+  | PNat !Word32
   deriving (Eq, Show)
 
 data Node
@@ -25,7 +27,12 @@ data Node
   | NodeAppT Prim Prim
   | NodeLam Prim Prim
   | NodeUnit
+  | NodeNat Word32
+  | NodeNatS
   | NodeClosure (Vector Prim)
+  deriving (Eq, Show)
+
+data Code = CPrim Prim | CNode Node
   deriving (Eq, Show)
 
 data Cell
@@ -34,8 +41,13 @@ data Cell
   | Empty
   deriving (Eq, Show)
 
+data PrimOp
+  = PSuc
+  deriving (Eq, Show)
+
 data Action
-  = Apply Prim
+  = Eval
+  | Apply Prim
   | Update Int
   | Spread Int
   | Extend Prim
@@ -45,30 +57,30 @@ data State s
   = State
   { heapPointer :: STRef s Int
   , heap :: MVector s Cell
-  , stack :: STRef s [Action]
-  , current :: STRef s Prim
+  , kont :: STRef s [Action]
+  , code :: STRef s Code
   }
 
 data Trace
   = Trace
   { traceHP :: Int
   , traceHeap :: Vector Cell
-  , traceStack :: [Action]
-  , traceCurrent :: Prim
+  , traceKont :: [Action]
+  , traceCode :: Code
   } deriving (Eq, Show)
 
 traceState :: State s -> ST s Trace
 traceState st = do
   h <- readSTRef $ heapPointer st
   hp <- Vector.freeze $ heap st
-  stk <- readSTRef $ stack st
-  cur <- readSTRef $ current st
+  ks <- readSTRef $ kont st
+  cde <- readSTRef $ code st
   pure $
     Trace
     { traceHP = h
     , traceHeap = hp
-    , traceStack = stk
-    , traceCurrent = cur
+    , traceKont = ks
+    , traceCode = cde
     }
 
 data RuntimeError
@@ -76,6 +88,7 @@ data RuntimeError
   | OutOfBounds
   | InvalidNode
   | Loop
+  | InvalidState Trace
   deriving (Eq, Show)
 
 alloc :: State s -> Cell -> ExceptT RuntimeError (ST s) Int
@@ -100,7 +113,7 @@ loadVar :: Exp -> ExceptT RuntimeError (ST s) Prim
 loadVar e =
   case toInt e of
     Nothing -> throwError InvalidNode
-    Just n -> pure $ Var n
+    Just n -> pure $ PVar n
 
 loadCtx :: State s -> Exp -> ExceptT RuntimeError (ST s) Prim
 loadCtx st e =
@@ -108,42 +121,45 @@ loadCtx st e =
     Nothing -> throwError InvalidNode
     Just as -> do
       as' <- traverse (load st) as
-      Addr <$> alloc st (Node $ NodeClosure $ Vector.fromList as')
+      PAddr <$> alloc st (Node $ NodeClosure $ Vector.fromList as')
 
 load :: State s -> Exp -> ExceptT RuntimeError (ST s) Prim
 load st e =
   case e of
-    Z{} -> loadVar e
-    S{} -> loadVar e
+    VZ{} -> loadVar e
+    VS{} -> loadVar e
+    NatZ -> pure $ PNat 0
+    NatS -> PAddr <$> alloc st (Node NodeNatS)
+    Nat n -> pure $ PNat n
     AppF a b -> do
       a' <- load st a
       b' <- load st b
-      Addr <$> alloc st (Node $ NodeAppF a' b')
+      PAddr <$> alloc st (Node $ NodeAppF a' b')
     AppT a b -> do
       a' <- load st a
       b' <- load st b
-      Addr <$> alloc st (Node $ NodeAppT a' b')
+      PAddr <$> alloc st (Node $ NodeAppT a' b')
     Lam a b -> do
       a' <- load st a
       b' <- load st b
-      Addr <$> alloc st (Node $ NodeLam a' b')
+      PAddr <$> alloc st (Node $ NodeLam a' b')
     Nil{} -> loadCtx st e
     Cons{} -> loadCtx st e
-    Unit -> Addr <$> alloc st (Node NodeUnit)
+    Unit -> PAddr <$> alloc st (Node NodeUnit)
     Ann a _ -> load st a
 
 initialState :: Int -> ST s (State s)
 initialState sz = do
   hp <- newSTRef 0
   h <- MVector.replicate sz Empty
-  stk <- newSTRef []
-  cur <- newSTRef undefined
+  ks <- newSTRef []
+  cde <- newSTRef undefined
   pure $
     State
     { heapPointer = hp
     , heap = h
-    , stack = stk
-    , current = cur
+    , kont = ks
+    , code = cde
     }
 
 run :: Int -> Exp -> Either RuntimeError [Trace]
@@ -155,89 +171,123 @@ run sz e =
 eval :: State s -> Exp -> ExceptT RuntimeError (ST s) [Trace]
 eval st e = do
   start <- load st e
-  lift $ writeSTRef (current st) start
+  lift $ writeSTRef (code st) (CPrim start)
+  lift $ modifySTRef (kont st) (Eval :)
   go
   where
-    go = do
+    halt = do
       tr <- lift $ traceState st
-      cur <- lift $ readSTRef (current st)
-      case cur of
-        Var{} -> pure []
-        Addr addr -> do
-          c <- read st addr
-          insts <- lift $ readSTRef (stack st)
-          case insts of
-            Update a : rest -> do
-              update st a c
+      pure [tr]
 
-              lift $ writeSTRef (stack st) rest
-              (tr :) <$> go
-            _ ->
-              case c of
-                Blackhole -> throwError Loop
-                Empty -> throwError InvalidNode
-                Node n ->
-                  case n of
-                    NodeAppF a b -> do
-                      insts <- lift $ readSTRef (stack st)
-                      case insts of
-                        Spread clAddr : rest -> do
-                          x <- alloc st . Node $ NodeAppT (Addr clAddr) a
-                          y <- alloc st . Node $ NodeAppT (Addr clAddr) b
-                          update st addr . Node $ NodeAppT (Addr x) (Addr y)
+    continue = do
+      tr <- lift $ traceState st
+      (tr :) <$> go
 
-                          lift $ writeSTRef (stack st) rest
-                          (tr :) <$> go
-                        _ -> pure [tr]
-                    NodeUnit -> pure [tr]
-                    NodeLam a b -> do
-                      insts <- lift $ readSTRef (stack st)
-                      case insts of
-                        Apply c : rest ->
-                          case a of
-                            Var{} -> throwError InvalidNode
-                            Addr a' -> do
-                              lift $ writeSTRef (current st) (Addr a')
+    invalidState = do
+      tr <- lift $ traceState st
+      throwError $ InvalidState tr
 
-                              lift $ writeSTRef (stack st) (Extend c : Apply b : rest)
-                              (tr :) <$> go
-                        Spread clAddr : rest -> do
-                          addr' <- alloc st (Node $ NodeAppT (Addr clAddr) a)
-                          update st addr . Node $ NodeLam (Addr addr') b
-
-                          lift $ writeSTRef (stack st) rest
-                          (tr :) <$> go
-                        _ -> pure [tr]
-                    NodeClosure cl -> do
-                      insts <- lift $ readSTRef (stack st)
-                      case insts of
-                        Apply c : rest -> do
-                          lift $ case c of
-                            Var n -> do
-                              writeSTRef (current st) (cl Vector.! n)
-                              writeSTRef (stack st) rest
-                            Addr a -> do
-                              writeSTRef (current st) (Addr a)
-                              writeSTRef (stack st) (Spread addr : rest)
-                          (tr :) <$> go
-                        Spread clAddr : rest -> do
-                          cl' <-
-                            traverse
-                            (\p -> Addr <$> alloc st (Node $ NodeAppT (Addr clAddr) p))
-                            cl
-                          update st addr . Node $ NodeClosure cl'
-
-                          lift $ writeSTRef (stack st) rest
-                          (tr :) <$> go
-                        Extend p : rest -> do
-                          addr' <- alloc st . Node $ NodeClosure (Vector.cons p cl)
-                          lift $ writeSTRef (current st) (Addr addr')
-
-                          lift $ writeSTRef (stack st) rest
-                          (tr :) <$> go
-                        _ -> pure [tr]
-                    NodeAppT a b -> do
-                      lift $ modifySTRef (stack st) ((Apply b :) . (Update addr :))
-
-                      lift $ writeSTRef (current st) a
-                      (tr :) <$> go
+    go = do
+      insts <- lift $ readSTRef (kont st)
+      case insts of
+        [] -> halt
+        Update a : rest -> do
+          cur <- lift $ readSTRef (code st)
+          case cur of
+            CPrim{} -> invalidState
+            CNode n -> update st a $ Node n
+          lift $ writeSTRef (kont st) rest
+          continue
+        Apply arg : rest -> do
+          cur <- lift $ readSTRef (code st)
+          case cur of
+            CPrim{} -> invalidState
+            CNode n ->
+              case n of
+                NodeAppF{} -> do
+                  addr' <- PAddr <$> alloc st (Node n)
+                  lift $ writeSTRef (code st) (CNode $ NodeAppF addr' arg)
+                  lift $ writeSTRef (kont st) rest
+                NodeAppT{} -> lift $ modifySTRef (kont st) (Eval :)
+                NodeLam a b -> do
+                  lift $ writeSTRef (code st) (CPrim a)
+                  lift $ writeSTRef (kont st) (Extend arg : Apply b : rest)
+                NodeUnit -> invalidState
+                NodeNat{} -> invalidState
+                NodeNatS ->
+                  case arg of
+                    PNat num -> do
+                      lift $ writeSTRef (code st) (CPrim $ PNat (num+1))
+                      lift $ writeSTRef (kont st) rest
+                    _ -> invalidState
+                NodeClosure cl -> do
+                  addr' <- alloc st (Node n)
+                  lift $ writeSTRef (kont st) (Spread addr' : rest)
+                  lift $ writeSTRef (code st) (CPrim arg)
+          continue
+        Extend addr : rest -> do
+          cur <- lift $ readSTRef (code st)
+          case cur of
+            CPrim{} -> invalidState
+            CNode n ->
+              case n of
+                NodeClosure cl -> do
+                  addr' <- PAddr <$> alloc st (Node $ NodeClosure $ Vector.cons addr cl)
+                  lift $ writeSTRef (kont st) rest
+                  lift $ writeSTRef (code st) (CPrim addr')
+                  continue
+                _ -> invalidState
+        Spread addr : rest -> do
+          cur <- lift $ readSTRef (code st)
+          case cur of
+            CPrim p ->
+              case p of
+                PNat{} -> invalidState
+                PVar v -> do
+                  c <- read st addr
+                  case c of
+                    Node (NodeClosure cl) -> lift $ writeSTRef (code st) (CPrim $ cl Vector.! v)
+                    _ -> invalidState
+                PAddr{} -> lift $ modifySTRef (kont st) (Eval :)
+            CNode n ->
+              case n of
+                NodeUnit -> invalidState
+                NodeNatS -> invalidState
+                NodeNat{} -> invalidState
+                NodeAppF a b -> _
+                NodeAppT{} -> _
+                NodeLam a b -> _
+                NodeClosure cl -> _
+          continue
+        Eval : rest -> do
+          cur <- lift $ readSTRef (code st)
+          case cur of
+            CPrim p ->
+              case p of
+                PVar{} -> do
+                  lift $ writeSTRef (kont st) rest
+                  continue
+                PNat{} -> do
+                  lift $ writeSTRef (kont st) rest
+                  continue
+                PAddr addr -> do
+                  c <- read st addr
+                  case c of
+                    Blackhole -> throwError Loop
+                    Empty -> throwError OutOfBounds
+                    Node n -> do
+                      lift $ writeSTRef (code st) (CNode n)
+                      lift $ writeSTRef (kont st) (Update addr : rest)
+                      continue
+            CNode n -> do
+              case n of
+                NodeNat{} -> lift $ writeSTRef (kont st) rest
+                NodeNatS -> lift $ writeSTRef (kont st) rest
+                NodeAppF{} -> lift $ writeSTRef (kont st) rest
+                NodeUnit -> lift $ writeSTRef (kont st) rest
+                NodeLam{} -> lift $ writeSTRef (kont st) rest
+                NodeClosure{} -> lift $ writeSTRef (kont st) rest
+                NodeAppT a b -> do
+                  lift $ writeSTRef (code st) (CPrim a)
+                  lift $ writeSTRef (kont st) (Eval : Apply b : rest)
+              continue
