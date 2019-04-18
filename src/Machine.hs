@@ -3,17 +3,17 @@ module Machine where
 import Prelude hiding (read)
 
 import Control.Monad (when)
-import Control.Monad.ST (ST)
-import Control.Monad.Except (ExceptT, throwError)
+import Control.Monad.ST (ST, runST)
+import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Control.Monad.Trans (lift)
-import Data.STRef (STRef, readSTRef, writeSTRef, modifySTRef)
+import Data.STRef (STRef, newSTRef, readSTRef, writeSTRef, modifySTRef)
 import Data.Vector (Vector)
 import Data.Vector.Mutable (MVector)
 
 import qualified Data.Vector as Vector
 import qualified Data.Vector.Mutable as MVector
 
-import Closure
+import Closure (Exp(..), toInt, toList)
 
 data Prim
   = Addr Int
@@ -31,21 +31,45 @@ data Node
 data Cell
   = Node Node
   | Blackhole
+  | Empty
   deriving (Eq, Show)
 
 data Action
   = Apply Prim
   | Update Int
+  | Spread Int
+  | Extend Prim
   deriving (Eq, Show)
 
 data State s
   = State
   { heapPointer :: STRef s Int
   , heap :: MVector s Cell
-  , env :: STRef s (Vector Prim)
   , stack :: STRef s [Action]
   , current :: STRef s Prim
   }
+
+data Trace
+  = Trace
+  { traceHP :: Int
+  , traceHeap :: Vector Cell
+  , traceStack :: [Action]
+  , traceCurrent :: Prim
+  } deriving (Eq, Show)
+
+traceState :: State s -> ST s Trace
+traceState st = do
+  h <- readSTRef $ heapPointer st
+  hp <- Vector.freeze $ heap st
+  stk <- readSTRef $ stack st
+  cur <- readSTRef $ current st
+  pure $
+    Trace
+    { traceHP = h
+    , traceHeap = hp
+    , traceStack = stk
+    , traceCurrent = cur
+    }
 
 data RuntimeError
   = HeapExhausted
@@ -108,49 +132,112 @@ load st e =
     Unit -> Addr <$> alloc st (Node NodeUnit)
     Ann a _ -> load st a
 
-eval :: State s -> Exp -> ExceptT RuntimeError (ST s) ()
+initialState :: Int -> ST s (State s)
+initialState sz = do
+  hp <- newSTRef 0
+  h <- MVector.replicate sz Empty
+  stk <- newSTRef []
+  cur <- newSTRef undefined
+  pure $
+    State
+    { heapPointer = hp
+    , heap = h
+    , stack = stk
+    , current = cur
+    }
+
+run :: Int -> Exp -> Either RuntimeError [Trace]
+run sz e =
+  runST $ do
+    st <- initialState sz
+    runExceptT $ eval st e
+
+eval :: State s -> Exp -> ExceptT RuntimeError (ST s) [Trace]
 eval st e = do
   start <- load st e
   lift $ writeSTRef (current st) start
   go
   where
     go = do
+      tr <- lift $ traceState st
       cur <- lift $ readSTRef (current st)
       case cur of
-        Var{} -> pure ()
+        Var{} -> pure []
         Addr addr -> do
           c <- read st addr
-          case c of
-            Blackhole -> throwError Loop
-            Node n ->
-              case n of
-                NodeAppF{} -> pure ()
-                NodeUnit -> pure ()
-                NodeLam a b -> do
-                  insts <- lift $ readSTRef (stack st)
-                  case insts of
-                    Apply c : rest -> do
-                      case a of
-                        Var{} -> throwError InvalidNode
-                        Addr a' -> do
-                          a'' <- read st a'
-                          case a'' of
-                            Blackhole -> throwError Loop
-                            Node (NodeClosure cl) -> do
-                              addr' <- alloc st (Node $ NodeClosure $ Vector.cons c cl)
-                              lift $ writeSTRef (stack st) rest
-                              update st addr (Node $ NodeAppT (Addr addr') b)
-                            _ -> throwError InvalidNode
-                    _ -> pure ()
-                NodeClosure cl -> do
-                  insts <- lift $ readSTRef (stack st)
-                  case insts of
-                    Apply c : rest ->
-                      case c of
-                        Var n -> lift $ writeSTRef (current st) (cl Vector.! n)
-                        Addr a -> _
-                    _ -> pure ()
-                NodeAppT a b ->
-                  lift $ do
-                    modifySTRef (stack st) ((Apply b :) . (Update addr :))
-                    writeSTRef (current st) a
+          insts <- lift $ readSTRef (stack st)
+          case insts of
+            Update a : rest -> do
+              update st a c
+
+              lift $ writeSTRef (stack st) rest
+              (tr :) <$> go
+            _ ->
+              case c of
+                Blackhole -> throwError Loop
+                Empty -> throwError InvalidNode
+                Node n ->
+                  case n of
+                    NodeAppF a b -> do
+                      insts <- lift $ readSTRef (stack st)
+                      case insts of
+                        Spread clAddr : rest -> do
+                          x <- alloc st . Node $ NodeAppT (Addr clAddr) a
+                          y <- alloc st . Node $ NodeAppT (Addr clAddr) b
+                          update st addr . Node $ NodeAppT (Addr x) (Addr y)
+
+                          lift $ writeSTRef (stack st) rest
+                          (tr :) <$> go
+                        _ -> pure [tr]
+                    NodeUnit -> pure [tr]
+                    NodeLam a b -> do
+                      insts <- lift $ readSTRef (stack st)
+                      case insts of
+                        Apply c : rest ->
+                          case a of
+                            Var{} -> throwError InvalidNode
+                            Addr a' -> do
+                              lift $ writeSTRef (current st) (Addr a')
+
+                              lift $ writeSTRef (stack st) (Extend c : Apply b : rest)
+                              (tr :) <$> go
+                        Spread clAddr : rest -> do
+                          addr' <- alloc st (Node $ NodeAppT (Addr clAddr) a)
+                          update st addr . Node $ NodeLam (Addr addr') b
+
+                          lift $ writeSTRef (stack st) rest
+                          (tr :) <$> go
+                        _ -> pure [tr]
+                    NodeClosure cl -> do
+                      insts <- lift $ readSTRef (stack st)
+                      case insts of
+                        Apply c : rest -> do
+                          lift $ case c of
+                            Var n -> do
+                              writeSTRef (current st) (cl Vector.! n)
+                              writeSTRef (stack st) rest
+                            Addr a -> do
+                              writeSTRef (current st) (Addr a)
+                              writeSTRef (stack st) (Spread addr : rest)
+                          (tr :) <$> go
+                        Spread clAddr : rest -> do
+                          cl' <-
+                            traverse
+                            (\p -> Addr <$> alloc st (Node $ NodeAppT (Addr clAddr) p))
+                            cl
+                          update st addr . Node $ NodeClosure cl'
+
+                          lift $ writeSTRef (stack st) rest
+                          (tr :) <$> go
+                        Extend p : rest -> do
+                          addr' <- alloc st . Node $ NodeClosure (Vector.cons p cl)
+                          lift $ writeSTRef (current st) (Addr addr')
+
+                          lift $ writeSTRef (stack st) rest
+                          (tr :) <$> go
+                        _ -> pure [tr]
+                    NodeAppT a b -> do
+                      lift $ modifySTRef (stack st) ((Apply b :) . (Update addr :))
+
+                      lift $ writeSTRef (current st) a
+                      (tr :) <$> go
