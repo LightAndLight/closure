@@ -19,15 +19,14 @@ data Exp
   | Cons !Exp !Exp
   | Unit
   | Ann !Exp !Ty
-  | NatZ
-  | NatS
-  | Nat !Word32
+  | Nat32 !Word32
+  | AddNat32 Exp Exp
   deriving (Eq, Show)
 
 data Ty
   = TyArr !Ty !Ty
   | TyUnit
-  | TyNat
+  | TyNat32
   deriving (Eq, Show)
 
 fromInt :: Int -> Exp
@@ -69,7 +68,7 @@ parseTy = token ty
       nat <|>
       between (token $ char '(') (char ')') (token ty)
     unit = TyUnit <$ string "Unit"
-    nat = TyNat <$ string "Nat"
+    nat = TyNat32 <$ string "Nat32"
     tyArr =
       (\a -> maybe a (TyArr a)) <$>
       atom <*>
@@ -88,16 +87,12 @@ parseExp = token expr
     appT = chainl1 atom (AppT <$ some space1)
     atom =
       unit <|>
-      zero <|>
-      suc <|>
-      nat <|>
+      nat32 <|>
       var <|>
       ctx <|>
       between (token $ char '(') (char ')') (token expr)
     unit = Unit <$ string "unit"
-    zero = NatZ <$ string "zero"
-    suc = NatS <$ string "suc"
-    nat = Nat . read <$> some digitChar
+    nat32 = Nat32 . read <$> some digitChar
     ctx =
       fromList <$>
       between
@@ -129,7 +124,6 @@ step (AppT a b) =
     AppF x y -> pure $ AppF (AppF x y) b
     Lam x y -> pure $ AppT (Cons b x) y
     Nil -> pure b
-    NatS | Nat n <- b -> pure $ Nat (n+1)
     Cons x _ | VZ <- b -> pure x
     Cons _ x | VS y <- b -> pure $ AppT x y
     Cons{} | AppF z w <- b -> pure $ AppT (a `AppT` z) (a `AppT` w)
@@ -150,7 +144,6 @@ step (Lam a b) =
 step (Cons a b) =
   (\a' -> Cons a' b) <$> step a <|>
   (\b' -> Cons a b') <$> step b
-step NatZ = pure $ Nat 0
 step _ = Nothing
 
 eval :: Exp -> Exp
@@ -207,8 +200,7 @@ infer ctx e =
       case ctx of
         [] -> error "stuck"
         _:ts -> infer ts n
-    NatZ -> pure TyNat
-    NatS -> pure $ TyArr TyNat TyNat
+    Nat32{} -> pure TyNat32
     AppF a b -> do
       aTy <- infer ctx a
       case aTy of
@@ -224,6 +216,10 @@ infer ctx e =
           pure retTy
         _ -> Left $ ExpectedFunction a
     Ann a b -> b <$ check ctx a b
+    AddNat32 a b -> do
+      check ctx a TyNat32
+      check ctx b TyNat32
+      pure TyNat32
     _ -> Left $ Can'tInfer e
 
 omega :: Exp

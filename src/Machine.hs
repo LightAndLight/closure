@@ -19,7 +19,11 @@ import Closure (Exp(..), toInt, toList)
 data Prim
   = PAddr !Int
   | PVar !Int
-  | PNat !Word32
+  | PNat32 !Word32
+  deriving (Eq, Show)
+
+data PrimOp
+  = PAddNat32 Prim Prim
   deriving (Eq, Show)
 
 data Node
@@ -27,9 +31,8 @@ data Node
   | NodeAppT Prim Prim
   | NodeLam Prim Prim
   | NodeUnit
-  | NodeNat Word32
-  | NodeNatS
   | NodeClosure (Vector Prim)
+  | NodePrimOp PrimOp
   deriving (Eq, Show)
 
 data Code = CPrim Prim | CNode Node
@@ -37,12 +40,9 @@ data Code = CPrim Prim | CNode Node
 
 data Cell
   = Node Node
+  | Prim Prim
   | Blackhole
   | Empty
-  deriving (Eq, Show)
-
-data PrimOp
-  = PSuc
   deriving (Eq, Show)
 
 data Action
@@ -128,9 +128,7 @@ load st e =
   case e of
     VZ{} -> loadVar e
     VS{} -> loadVar e
-    NatZ -> pure $ PNat 0
-    NatS -> PAddr <$> alloc st (Node NodeNatS)
-    Nat n -> pure $ PNat n
+    Nat32 n -> pure $ PNat32 n
     AppF a b -> do
       a' <- load st a
       b' <- load st b
@@ -146,6 +144,10 @@ load st e =
     Nil{} -> loadCtx st e
     Cons{} -> loadCtx st e
     Unit -> PAddr <$> alloc st (Node NodeUnit)
+    AddNat32 a b -> do
+      a' <- load st a
+      b' <- load st b
+      PAddr <$> alloc st (Node $ NodePrimOp $ PAddNat32 a' b')
     Ann a _ -> load st a
 
 initialState :: Int -> ST s (State s)
@@ -175,119 +177,151 @@ eval st e = do
   lift $ modifySTRef (kont st) (Eval :)
   go
   where
-    halt = do
-      tr <- lift $ traceState st
-      pure [tr]
+    halt tr = pure [tr]
 
-    continue = do
-      tr <- lift $ traceState st
-      (tr :) <$> go
+    continue tr = (tr :) <$> go
 
-    invalidState = do
-      tr <- lift $ traceState st
-      throwError $ InvalidState tr
+    invalidState :: Trace -> ExceptT RuntimeError (ST s) a
+    invalidState tr = throwError $ InvalidState tr
 
     go = do
+      tr <- lift $ traceState st
       insts <- lift $ readSTRef (kont st)
       case insts of
-        [] -> halt
+        [] -> halt tr
         Update a : rest -> do
           cur <- lift $ readSTRef (code st)
           case cur of
-            CPrim{} -> invalidState
+            CPrim p -> update st a $ Prim p
             CNode n -> update st a $ Node n
           lift $ writeSTRef (kont st) rest
-          continue
+          continue tr
         Apply arg : rest -> do
           cur <- lift $ readSTRef (code st)
           case cur of
-            CPrim{} -> invalidState
+            CPrim{} -> invalidState tr
             CNode n ->
               case n of
+                NodePrimOp{} -> invalidState tr
                 NodeAppF{} -> do
                   addr' <- PAddr <$> alloc st (Node n)
                   lift $ writeSTRef (code st) (CNode $ NodeAppF addr' arg)
                   lift $ writeSTRef (kont st) rest
-                NodeAppT{} -> lift $ modifySTRef (kont st) (Eval :)
+                NodeAppT{} ->
+                  lift $ modifySTRef (kont st) (Eval :)
                 NodeLam a b -> do
                   lift $ writeSTRef (code st) (CPrim a)
-                  lift $ writeSTRef (kont st) (Extend arg : Apply b : rest)
-                NodeUnit -> invalidState
-                NodeNat{} -> invalidState
-                NodeNatS ->
-                  case arg of
-                    PNat num -> do
-                      lift $ writeSTRef (code st) (CPrim $ PNat (num+1))
-                      lift $ writeSTRef (kont st) rest
-                    _ -> invalidState
-                NodeClosure cl -> do
+                  lift $ writeSTRef (kont st) (Eval : Extend arg : Apply b : Eval : rest)
+                NodeUnit -> invalidState tr
+                NodeClosure{}  -> do
                   addr' <- alloc st (Node n)
-                  lift $ writeSTRef (kont st) (Spread addr' : rest)
                   lift $ writeSTRef (code st) (CPrim arg)
-          continue
+                  lift $ writeSTRef (kont st) (Spread addr' : rest)
+          continue tr
         Extend addr : rest -> do
           cur <- lift $ readSTRef (code st)
           case cur of
-            CPrim{} -> invalidState
+            CPrim{} -> invalidState tr
             CNode n ->
               case n of
                 NodeClosure cl -> do
-                  addr' <- PAddr <$> alloc st (Node $ NodeClosure $ Vector.cons addr cl)
+                  lift $ writeSTRef (code st) (CNode $ NodeClosure $ Vector.cons addr cl)
                   lift $ writeSTRef (kont st) rest
-                  lift $ writeSTRef (code st) (CPrim addr')
-                  continue
-                _ -> invalidState
+                  continue tr
+                _ -> invalidState tr
         Spread addr : rest -> do
           cur <- lift $ readSTRef (code st)
           case cur of
             CPrim p ->
               case p of
-                PNat{} -> invalidState
+                PNat32{} -> invalidState tr
                 PVar v -> do
                   c <- read st addr
                   case c of
                     Node (NodeClosure cl) -> lift $ writeSTRef (code st) (CPrim $ cl Vector.! v)
-                    _ -> invalidState
+                    _ -> invalidState tr
                 PAddr{} -> lift $ modifySTRef (kont st) (Eval :)
             CNode n ->
               case n of
-                NodeUnit -> invalidState
-                NodeNatS -> invalidState
-                NodeNat{} -> invalidState
-                NodeAppF a b -> _
-                NodeAppT{} -> _
-                NodeLam a b -> _
-                NodeClosure cl -> _
-          continue
+                NodePrimOp p -> do
+                  c <- read st addr
+                  case c of
+                    Node (NodeClosure cl) ->
+                      case p of
+                        PAddNat32 a b -> do
+                          a' <-
+                            case a of
+                              PNat32{} -> pure a
+                              PAddr{} -> invalidState tr
+                              PVar v -> pure $ cl Vector.! v
+                          b' <-
+                            case b of
+                              PNat32{} -> pure b
+                              PAddr{} -> invalidState tr
+                              PVar v -> pure $ cl Vector.! v
+                          lift $ writeSTRef (code st) (CNode $ NodePrimOp $ PAddNat32 a' b')
+                          lift $ writeSTRef (kont st) rest
+                    _ -> invalidState tr
+                NodeUnit -> invalidState tr
+                NodeAppF a b -> do
+                  a' <- PAddr <$> alloc st (Node $ NodeAppT (PAddr addr) a)
+                  b' <- PAddr <$> alloc st (Node $ NodeAppT (PAddr addr) b)
+                  lift $ writeSTRef (code st) (CNode $ NodeAppT a' b')
+                  lift $ writeSTRef (kont st) rest
+                NodeAppT{} -> lift $ modifySTRef (kont st) (Eval :)
+                NodeLam a b -> do
+                  a' <- PAddr <$> alloc st (Node $ NodeAppT (PAddr addr) a)
+                  lift $ writeSTRef (code st) (CNode $ NodeLam a' b)
+                  lift $ writeSTRef (kont st) rest
+                NodeClosure cl -> do
+                  cl' <- traverse (\c -> PAddr <$> alloc st (Node $ NodeAppT (PAddr addr) c)) cl
+                  lift $ writeSTRef (code st) (CNode $ NodeClosure cl')
+                  lift $ writeSTRef (kont st) rest
+          continue tr
         Eval : rest -> do
           cur <- lift $ readSTRef (code st)
+          let
+            evalNode n =
+              case n of
+                NodePrimOp p ->
+                  case p of
+                    PAddNat32 a b ->
+                      case (a, b) of
+                        (PNat32 v1, PNat32 v2) -> do
+                          lift $ writeSTRef (code st) (CPrim $ PNat32 (v1+v2))
+                        _ -> pure ()
+                NodeAppF{} -> pure ()
+                NodeUnit -> pure ()
+                NodeLam{} -> pure ()
+                NodeClosure{} -> pure ()
+                NodeAppT a b -> do
+                  lift $ writeSTRef (code st) (CPrim a)
+                  lift $ modifySTRef (kont st) ((:) Eval . (:) (Apply b))
+
           case cur of
             CPrim p ->
               case p of
                 PVar{} -> do
                   lift $ writeSTRef (kont st) rest
-                  continue
-                PNat{} -> do
+                  continue tr
+                PNat32{} -> do
                   lift $ writeSTRef (kont st) rest
-                  continue
+                  continue tr
                 PAddr addr -> do
                   c <- read st addr
                   case c of
+                    Prim p' -> do
+                      lift $ writeSTRef (code st) (CPrim p')
+                      lift $ writeSTRef (kont st) rest
+                      continue tr
                     Blackhole -> throwError Loop
                     Empty -> throwError OutOfBounds
                     Node n -> do
-                      lift $ writeSTRef (code st) (CNode n)
                       lift $ writeSTRef (kont st) (Update addr : rest)
-                      continue
+                      lift $ writeSTRef (code st) (CNode n)
+                      evalNode n
+                      continue tr
             CNode n -> do
-              case n of
-                NodeNat{} -> lift $ writeSTRef (kont st) rest
-                NodeNatS -> lift $ writeSTRef (kont st) rest
-                NodeAppF{} -> lift $ writeSTRef (kont st) rest
-                NodeUnit -> lift $ writeSTRef (kont st) rest
-                NodeLam{} -> lift $ writeSTRef (kont st) rest
-                NodeClosure{} -> lift $ writeSTRef (kont st) rest
-                NodeAppT a b -> do
-                  lift $ writeSTRef (code st) (CPrim a)
-                  lift $ writeSTRef (kont st) (Eval : Apply b : rest)
-              continue
+              lift $ writeSTRef (kont st) rest
+              evalNode n
+              continue tr
