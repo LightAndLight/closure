@@ -155,6 +155,7 @@ data TypeError
   | ExpectedArrow Exp Ty
   | Can'tInfer Exp
   | ExpectedContext Exp
+  | ScopeError
   deriving (Eq, Show)
 
 check :: [Ty] -> Exp -> Ty -> Either TypeError ()
@@ -194,11 +195,11 @@ infer ctx e =
     Unit -> pure TyUnit
     VZ ->
       case ctx of
-        [] -> error "stuck"
+        [] -> Left ScopeError
         t:_ -> pure t
     VS n ->
       case ctx of
-        [] -> error "stuck"
+        [] -> Left ScopeError
         _:ts -> infer ts n
     Nat32{} -> pure TyNat32
     AppF a b -> do
