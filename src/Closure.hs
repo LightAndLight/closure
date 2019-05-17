@@ -14,6 +14,7 @@ data Exp
   | VS !Exp
   | AppF !Exp !Exp
   | AppT !Exp !Exp
+  | Subst !Exp !Exp
   | Lam !Exp !Exp
   | Nil
   | Cons !Exp !Exp
@@ -27,6 +28,7 @@ data Ty
   = TyArr !Ty !Ty
   | TyUnit
   | TyNat32
+  | TySub [Ty]
   deriving (Eq, Show)
 
 fromInt :: Int -> Exp
@@ -122,17 +124,19 @@ step (AppT a b) =
     VZ -> pure $ AppF VZ b
     VS{} -> pure $ AppF a b
     AppF x y -> pure $ AppF (AppF x y) b
-    Lam x y -> pure $ AppT (Cons b x) y
+    Lam x y -> pure $ Cons b x `Subst` y
+    _ -> Nothing
+step (Subst a b) =
+  (\a' -> Subst a' b) <$> step a <|>
+  (\b' -> Subst a b') <$> step b <|>
+  case a of
     Nil -> pure b
     Cons x _ | VZ <- b -> pure x
-    Cons _ x | VS y <- b -> pure $ AppT x y
-    Cons{} | AppF z w <- b -> pure $ AppT (a `AppT` z) (a `AppT` w)
-    Cons{} | Lam z w <- b -> pure $ Lam (a `AppT` z) w
+    Cons _ x | VS y <- b -> pure $ Subst x y
+    Cons{} | AppF z w <- b -> pure $ AppT (a `Subst` z) (a `Subst` w)
+    Cons{} | Lam z w <- b -> pure $ Lam (a `Subst` z) w
     Cons{} | Nil <- b -> pure Nil
-    Cons{} | Cons z w <- b -> pure $ Cons (a `AppT` z) (a `AppT` w)
-    Ann e t ->
-      (\e' -> Ann e' t) <$> step e <|>
-      pure e
+    Cons{} | Cons z w <- b -> pure $ Cons (a `Subst` z) (a `Subst` w)
     _ -> Nothing
 step (VS a) = VS <$> step a
 step (AppF a b ) =
@@ -144,6 +148,7 @@ step (Lam a b) =
 step (Cons a b) =
   (\a' -> Cons a' b) <$> step a <|>
   (\b' -> Cons a b') <$> step b
+step (Ann a _) = Just a
 step _ = Nothing
 
 eval :: Exp -> Exp
@@ -154,7 +159,7 @@ data TypeError
   | ExpectedFunction Exp
   | ExpectedArrow Exp Ty
   | Can'tInfer Exp
-  | ExpectedContext Exp
+  | ExpectedTySub Exp
   | ScopeError
   deriving (Eq, Show)
 
@@ -164,34 +169,27 @@ check ctx e ty =
     Lam a b ->
       case ty of
         TyArr u t -> do
-          ctx' <- inferCtx ctx a
-          check (u : ctx') b t
+          uTy <- infer ctx a
+          case uTy of
+            TySub ctx' -> check (u : ctx') b t
+            _ -> Left $ ExpectedTySub a
         _ -> Left $ ExpectedArrow e ty
-    AppT a b | isCtx a -> do
-      ctx' <- inferCtx ctx a
-      check ctx' b ty
     _ -> do
       eTy <- infer ctx e
       if eTy == ty
         then pure ()
         else Left $ TypeMismatch ty eTy
 
-inferCtx :: [Ty] -> Exp -> Either TypeError [Ty]
-inferCtx ctx e =
-  case e of
-    Nil -> pure []
-    Cons a b -> do
-      aTy <- infer ctx a
-      ctx' <- inferCtx ctx b
-      pure $ aTy : ctx'
-    AppT a b | isCtx b -> do
-      ctx' <- inferCtx ctx a
-      inferCtx ctx' b
-    _ -> Left $ ExpectedContext e
-
 infer :: [Ty] -> Exp -> Either TypeError Ty
 infer ctx e =
   case e of
+    Nil -> pure $ TySub []
+    Cons a b -> do
+      aTy <- infer ctx a
+      bTy <- infer ctx b
+      case bTy of
+        TySub bs -> pure . TySub $ aTy : bs
+        _ -> Left $ ExpectedTySub b
     Unit -> pure TyUnit
     VZ ->
       case ctx of
@@ -209,13 +207,18 @@ infer ctx e =
           check ctx b bTy
           pure retTy
         _ -> Left $ ExpectedFunction a
-    AppT a b | not (isCtx a), not (isCtx b) -> do
+    AppT a b -> do
       aTy <- infer ctx a
       case aTy of
         TyArr bTy retTy -> do
           check ctx b bTy
           pure retTy
         _ -> Left $ ExpectedFunction a
+    Subst a b -> do
+      aTy <- infer ctx a
+      case aTy of
+        TySub ctx' -> infer ctx' b
+        _ -> Left $ ExpectedTySub a
     Ann a b -> b <$ check ctx a b
     AddNat32 a b -> do
       check ctx a TyNat32
