@@ -16,11 +16,13 @@ category:            Language
 extra-source-files:  CHANGELOG.md
 
 library
-  exposed-modules:     Closure, ANF, Machine
+  exposed-modules:     Closure, ANF, Machine, LL, LLVM
   build-depends:       base ^>=4.12.0.0
                      , megaparsec
                      , mtl
                      , vector
+                     , ansi-wl-pprint
+                     , llvm-hs-pure ^>=7.0
   ghc-options:         -Wall -Werror
   hs-source-dirs:      src
   default-language:    Haskell2010
